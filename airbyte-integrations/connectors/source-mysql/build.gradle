@@ -17,10 +17,22 @@ dependencies {
     // Force Debezium 3.4.2.Final to pick up null-safe MySqlGtidSet.UUIDSet handling (PR #75559).
     // Avoids NPE in CDK pre-flight UUIDSet comparison after RDS UUID drift / replica promotion / source-endpoint switch.
     api enforcedPlatform('io.debezium:debezium-bom:3.4.2.Final')
-    api "com.google.protobuf:protobuf-java:4.27.5" // for fixing vulnerability of protobuf-java used by Debezium
+    api "com.google.protobuf:protobuf-java:4.30.0"
     implementation 'com.mysql:mysql-connector-j:9.1.0'
     implementation 'io.debezium:debezium-connector-mysql'
 
     testImplementation 'org.testcontainers:mysql'
     testImplementation 'io.mockk:mockk:1.12.0'
+}
+
+// The Debezium BOM (enforcedPlatform above) pins protobuf-java to 3.25.5, but the bulk CDK's
+// protoc / protobuf-kotlin are 4.30.0 and the CDK's generated AirbyteMessageProtobuf references
+// com.google.protobuf.RuntimeVersion (added in 4.28). With 3.25.5 on the classpath the connector
+// crashes with NoClassDefFoundError when run in SOCKET/PROTOBUF data-channel mode. A plain `api`
+// pin can't override an enforcedPlatform, so force protobuf-java to 4.30.0 across all configs to
+// match protobuf-kotlin and the generated code. 4.30.0 > 3.25.5, so the Debezium CVE fix still holds.
+configurations.all {
+    resolutionStrategy {
+        force 'com.google.protobuf:protobuf-java:4.30.0'
+    }
 }
