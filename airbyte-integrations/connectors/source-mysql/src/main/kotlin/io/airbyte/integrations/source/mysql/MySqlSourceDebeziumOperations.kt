@@ -55,6 +55,7 @@ import java.io.ByteArrayOutputStream
 import java.math.BigDecimal
 import java.sql.Connection
 import java.sql.ResultSet
+import java.sql.SQLException
 import java.sql.SQLSyntaxErrorException
 import java.sql.Statement
 import java.time.Instant
@@ -218,6 +219,93 @@ class MySqlSourceDebeziumOperations(
     private fun validate(debeziumState: UnvalidatedDeserializedState): DebeziumWarmStartState {
         val savedStateOffset: SavedOffset = parseSavedOffset(debeziumState)
         val (livePosition: MySqlSourceCdcPosition, gtidSet: String?) = queryPositionAndGtids()
+
+        // v9: gtid_mode gate.
+        // When the server is not in full GTID mode (@@global.gtid_mode != "ON" — i.e. OFF,
+        // OFF_PERMISSIVE, or ON_PERMISSIVE) Debezium tracks the CDC resume position purely by
+        // binlog file+pos and does NOT advance the saved GTID set. Running the GTID
+        // containment/purge checks against that frozen saved set produces false-positive aborts
+        // as the server's gtid_purged floor advances past the stale saved value, even though the
+        // real (file+pos) resume position is still perfectly valid. So when gtid_mode is not ON,
+        // skip all GTID validation entirely and validate purely by confirming the saved binlog
+        // file is still present on the server. GTID validation resumes automatically once the
+        // server's gtid_mode becomes ON.
+        val gtidModeOn: Boolean = queryGtidMode().equals("ON", ignoreCase = true)
+        val gtidValidationResult: DebeziumWarmStartState? =
+            if (gtidModeOn) {
+                validateGtidState(debeziumState, savedStateOffset, livePosition, gtidSet)
+            } else {
+                val existingLogFiles: List<String> = getBinaryLogFileNames()
+                if (!existingLogFiles.contains(savedStateOffset.position.fileName)) {
+                    abortCdcSync(
+                        "Connector last known binlog file ${savedStateOffset.position.fileName} is not found in the server. Server has $existingLogFiles"
+                    )
+                } else {
+                    log.info {
+                        "v9: server gtid_mode is not ON; skipping GTID validation and validating " +
+                            "the CDC resume position via binlog file presence only. Saved file " +
+                            "${savedStateOffset.position.fileName} is present on the server."
+                    }
+                    null
+                }
+            }
+        if (gtidValidationResult != null) {
+            return gtidValidationResult
+        }
+
+        // Schema-history full rebuild (v7).
+        //
+        // Background: Airbyte source-mysql runs Debezium with snapshot.mode=recovery and never
+        // issues SHOW CREATE TABLE itself. Schema history is built entirely from binlog DDL
+        // events visible at sync time, which depends on the current host's binlog retention.
+        // Any table whose CREATE TABLE pre-dates retention is permanently absent from history,
+        // and the first row event for it crashes Debezium with "schema isn't known to this
+        // connector". Master <-> replica swap is hostile to this because each host retains a
+        // different binlog window.
+        //
+        // v6 attempted a coverage-based bootstrap (regex-match existing DDLs to find covered
+        // table names, only synthesize CREATE TABLE for missing tables). That failed in
+        // practice — the coverage regex either matched some incidental "CREATE TABLE X"
+        // substring or the existing DDL for X was present but Debezium's parser silently
+        // failed to register the table, leaving Debezium without a schema while v6 thought
+        // the table was covered.
+        //
+        // v7 approach: stop trusting the existing schema history. Replace it entirely with a
+        // fresh, complete set of CREATE TABLE statements pulled live via SHOW CREATE TABLE for
+        // every table in information_schema for the configured database. Since SHOW CREATE
+        // TABLE returns the *current* schema (post all historical ALTERs), this is
+        // semantically equivalent to replaying all historical DDLs and ending at the latest
+        // state. No information lost. Bounded size (N records, N = current table count).
+        //
+        // Safety: if information_schema or any SHOW CREATE TABLE call fails, fall back to
+        // existing history rather than partial-replace. Worst-case v7 is no worse than v6.
+        val rebuiltSchemaHistory: DebeziumSchemaHistory? =
+            try {
+                rebuildSchemaHistoryFromSource(
+                    existing = debeziumState.schemaHistory,
+                    referencePosition = savedStateOffset.position,
+                )
+            } catch (e: Exception) {
+                log.warn(e) {
+                    "Schema history rebuild failed; proceeding with existing history. " +
+                        "${e.message}"
+                }
+                debeziumState.schemaHistory
+            }
+        return ValidDebeziumWarmStartState(debeziumState.offset, rebuiltSchemaHistory)
+    }
+
+    /**
+     * GTID-based CDC offset validation. Only invoked when the server's gtid_mode is "ON" (see
+     * [validate]). Returns null when the saved offset is valid to resume from; otherwise returns
+     * an abort/reset warm-start state describing why the saved offset is unusable.
+     */
+    private fun validateGtidState(
+        debeziumState: UnvalidatedDeserializedState,
+        savedStateOffset: SavedOffset,
+        livePosition: MySqlSourceCdcPosition,
+        gtidSet: String?,
+    ): DebeziumWarmStartState? {
         if (gtidSet.isNullOrEmpty() && !savedStateOffset.gtidSet.isNullOrEmpty()) {
             return abortCdcSync(
                 "Connector used GTIDs previously, but MySQL server does not know of any GTIDs or they are not enabled"
@@ -361,46 +449,7 @@ class MySqlSourceDebeziumOperations(
             }
         }
 
-        // Schema-history full rebuild (v7).
-        //
-        // Background: Airbyte source-mysql runs Debezium with snapshot.mode=recovery and never
-        // issues SHOW CREATE TABLE itself. Schema history is built entirely from binlog DDL
-        // events visible at sync time, which depends on the current host's binlog retention.
-        // Any table whose CREATE TABLE pre-dates retention is permanently absent from history,
-        // and the first row event for it crashes Debezium with "schema isn't known to this
-        // connector". Master <-> replica swap is hostile to this because each host retains a
-        // different binlog window.
-        //
-        // v6 attempted a coverage-based bootstrap (regex-match existing DDLs to find covered
-        // table names, only synthesize CREATE TABLE for missing tables). That failed in
-        // practice — the coverage regex either matched some incidental "CREATE TABLE X"
-        // substring or the existing DDL for X was present but Debezium's parser silently
-        // failed to register the table, leaving Debezium without a schema while v6 thought
-        // the table was covered.
-        //
-        // v7 approach: stop trusting the existing schema history. Replace it entirely with a
-        // fresh, complete set of CREATE TABLE statements pulled live via SHOW CREATE TABLE for
-        // every table in information_schema for the configured database. Since SHOW CREATE
-        // TABLE returns the *current* schema (post all historical ALTERs), this is
-        // semantically equivalent to replaying all historical DDLs and ending at the latest
-        // state. No information lost. Bounded size (N records, N = current table count).
-        //
-        // Safety: if information_schema or any SHOW CREATE TABLE call fails, fall back to
-        // existing history rather than partial-replace. Worst-case v7 is no worse than v6.
-        val rebuiltSchemaHistory: DebeziumSchemaHistory? =
-            try {
-                rebuildSchemaHistoryFromSource(
-                    existing = debeziumState.schemaHistory,
-                    referencePosition = savedStateOffset.position,
-                )
-            } catch (e: Exception) {
-                log.warn(e) {
-                    "Schema history rebuild failed; proceeding with existing history. " +
-                        "${e.message}"
-                }
-                debeziumState.schemaHistory
-            }
-        return ValidDebeziumWarmStartState(debeziumState.offset, rebuiltSchemaHistory)
+        return null
     }
 
     private val createTableHeadPattern: Regex =
@@ -685,6 +734,33 @@ class MySqlSourceDebeziumOperations(
                 stmt.executeQuery(sql).use { rs: ResultSet ->
                     if (!rs.next()) throw ConfigErrorException("No results for query: $sql")
                     return MySqlGtidSet(rs.getString(purgedGtidField.id))
+                }
+            }
+        }
+    }
+
+    private fun queryGtidMode(): String {
+        val gtidModeField = Field("@@global.gtid_mode", StringFieldType)
+        jdbcConnectionFactory.get().use { connection: Connection ->
+            connection.createStatement().use { stmt: Statement ->
+                val sql = "SELECT @@global.gtid_mode"
+                try {
+                    stmt.executeQuery(sql).use { rs: ResultSet ->
+                        return if (!rs.next()) "" else rs.getString(gtidModeField.id)?.trim() ?: ""
+                    }
+                } catch (e: SQLException) {
+                    // @@global.gtid_mode does not exist before MySQL 5.6.5. Treat its absence
+                    // (or any failure reading it) as "GTID not enabled" so validation falls back
+                    // to binlog file+pos presence, consistent with how queryPositionAndGtids()
+                    // tolerates version-dependent SQL syntax. queryPositionAndGtids() has already
+                    // succeeded on this connection by the time we get here, so a failure here is
+                    // almost certainly an unknown-system-variable error on an old server.
+                    log.warn(e) {
+                        "Could not read @@global.gtid_mode (likely a pre-5.6.5 MySQL without " +
+                            "GTID support); treating gtid_mode as not ON and validating the CDC " +
+                            "resume position via binlog file+pos presence only."
+                    }
+                    return ""
                 }
             }
         }
