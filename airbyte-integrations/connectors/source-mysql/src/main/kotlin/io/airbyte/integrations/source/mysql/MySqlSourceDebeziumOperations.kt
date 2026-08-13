@@ -279,20 +279,39 @@ class MySqlSourceDebeziumOperations(
         //
         // Safety: if information_schema or any SHOW CREATE TABLE call fails, fall back to
         // existing history rather than partial-replace. Worst-case v7 is no worse than v6.
-        val rebuiltSchemaHistory: DebeziumSchemaHistory? =
-            try {
-                rebuildSchemaHistoryFromSource(
-                    existing = debeziumState.schemaHistory,
-                    referencePosition = savedStateOffset.position,
-                )
-            } catch (e: Exception) {
-                log.warn(e) {
-                    "Schema history rebuild failed; proceeding with existing history. " +
-                        "${e.message}"
+        // v10: only rebuild when there is no saved schema history to start from.
+        //
+        // The v7 full-replace above breaks in-place schema evolution. When a column is added on
+        // the source, the SHOW CREATE TABLE rebuild seeds the connector with the *current*
+        // (post-ALTER) table shape, but the connector resumes streaming from a saved binlog
+        // offset that predates the ALTER. Debezium then validates old, pre-ALTER row events
+        // (N-1 columns) against the rebuilt N-column schema and aborts with
+        // "internal schema size N, but row size N-1, restart connector with schema recovery
+        // mode". Stock Debezium instead replays the ALTER DDL from the binlog at its correct
+        // position and evolves the schema in lockstep — which is how a new column is normally
+        // auto-propagated.
+        //
+        // So: keep the saved schema history whenever it is non-empty (let binlog DDL replay
+        // drive schema evolution), and fall back to the SHOW CREATE TABLE rebuild only when
+        // there is no saved history to resume from — the empty-history case the v7 rebuild was
+        // originally meant to cover. (A non-empty-but-incomplete history — e.g. a table missing
+        // after a swap + retention gap — is no longer force-rebuilt; that trade is accepted here
+        // in favour of not breaking column additions.)
+        val schemaHistory: DebeziumSchemaHistory? =
+            debeziumState.schemaHistory?.takeIf { it.wrapped.isNotEmpty() }
+                ?: try {
+                    rebuildSchemaHistoryFromSource(
+                        existing = debeziumState.schemaHistory,
+                        referencePosition = savedStateOffset.position,
+                    )
+                } catch (e: Exception) {
+                    log.warn(e) {
+                        "Schema history rebuild failed; proceeding with existing history. " +
+                            "${e.message}"
+                    }
+                    debeziumState.schemaHistory
                 }
-                debeziumState.schemaHistory
-            }
-        return ValidDebeziumWarmStartState(debeziumState.offset, rebuiltSchemaHistory)
+        return ValidDebeziumWarmStartState(debeziumState.offset, schemaHistory)
     }
 
     /**
